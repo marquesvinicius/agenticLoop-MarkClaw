@@ -47,8 +47,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from agent import run_agent
+from agent import run_agent, get_session_cost, reset_session_cost
 from memory import ConversationMemory
+from security import check_prompt_injection, log_injection_blocked
 
 # ─────────────────────────────────────────────────────────────
 # INICIALIZAÇÃO
@@ -141,6 +142,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     chat_id = update.effective_chat.id
     memory.clear(chat_id)
+    reset_session_cost(chat_id)
 
     welcome = (
         "👋 *Olá! Sou um agente autônomo inteligente.*\n\n"
@@ -154,6 +156,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "*Comandos disponíveis:*\n"
         "/start — reiniciar a conversa\n"
         "/clear — limpar o histórico\n"
+        "/custo — ver gasto da sessão atual\n"
         "/help  — ver exemplos de uso\n\n"
         "Como posso ajudar você hoje?"
     )
@@ -167,14 +170,50 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler para /clear — limpa o histórico do chat atual."""
+    """Handler para /clear — limpa o histórico do chat atual e zera custo da sessão."""
     chat_id = update.effective_chat.id
     memory.clear(chat_id)
+    reset_session_cost(chat_id)
     await update.message.reply_text(
         "🗑️ Histórico limpo! Começando uma conversa nova.\n"
         "O que você gostaria de saber?"
     )
     print(f"{Fore.YELLOW}[🗑️  CLEAR] Histórico limpo — chat_id={chat_id}{Style.RESET_ALL}")
+
+
+async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler para /custo — exibe o custo acumulado da sessão atual.
+
+    Cada interação com a IA consome tokens cobrados pela Google.
+    Este comando mostra o gasto desde o início da conversa (ou desde o último /clear).
+    """
+    chat_id = update.effective_chat.id
+    session_cost, turns = get_session_cost(chat_id)
+
+    if turns == 0:
+        await update.message.reply_text(
+            "💰 *Custo da sessão atual*\n\n"
+            "Nenhuma interação realizada ainda nesta sessão.\n"
+            "_Envie uma mensagem e depois use /custo para ver o gasto._",
+            parse_mode="Markdown"
+        )
+        return
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    await update.message.reply_text(
+        f"💰 *Custo da sessão atual*\n\n"
+        f"• Interações realizadas: *{turns}*\n"
+        f"• Custo total: *${session_cost:.6f} USD*\n"
+        f"• Custo médio por turno: *${session_cost / turns:.6f} USD*\n"
+        f"• Modelo: `{model}`\n\n"
+        f"_Use /clear para zerar o contador e iniciar nova sessão._",
+        parse_mode="Markdown"
+    )
+    print(
+        f"{Fore.GREEN}[💰 CUSTO] Sessão chat_id={chat_id} — "
+        f"${session_cost:.6f} USD em {turns} turno(s){Style.RESET_ALL}"
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,6 +234,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "*Perguntas gerais:*\n"
         "• \"O que é machine learning?\"\n"
         "• \"Explique o conceito de recursão\"\n\n"
+        "*Comandos:*\n"
+        "/start — reiniciar a conversa\n"
+        "/clear — limpar o histórico\n"
+        "/custo — ver gasto em USD da sessão atual\n"
+        "/help  — esta mensagem\n\n"
         "_Dica: o raciocínio do agente aparece no terminal, "
         "não aqui no Telegram._"
     )
@@ -217,6 +261,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     chat_id = update.effective_chat.id
     user_message = update.message.text
+
+    # ── FILTRO DE SEGURANÇA — injeção de prompt ──────────────────────────────
+    # Executado ANTES de qualquer chamada à LLM: custo zero de tokens
+    # e resposta imediata ao usuário em caso de ataque detectado.
+    is_injection, matched_label = check_prompt_injection(user_message)
+    if is_injection:
+        log_injection_blocked(chat_id, user_message, matched_label)
+        await update.message.reply_text(
+            "⚠️ Mensagem bloqueada.\n\n"
+            "Detectei uma tentativa de manipulação das minhas instruções de sistema. "
+            "Esse tipo de mensagem não é processado por segurança.\n\n"
+            "Se quiser fazer uma pergunta legítima, estou à disposição! 😊"
+        )
+        return
+    # ────────────────────────────────────────────────────────────────────────
 
     # Exibe "digitando..." enquanto o agente processa
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -349,6 +408,7 @@ def main() -> None:
     # Registra os handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("custo", cost_command))
     app.add_handler(CommandHandler("help", help_command))
     # Captura todas as mensagens de texto que não são comandos
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

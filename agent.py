@@ -57,6 +57,39 @@ _DEPRECATED_MODELS = {
 _FALLBACK_MODEL = "gemini-2.5-flash-lite"
 _DEFAULT_MODEL = "gemini-2.5-flash-lite"
 
+# ─────────────────────────────────────────────────────────────
+# TABELA DE PREÇOS — Google Gemini (USD por 1 milhão de tokens)
+# Fonte: https://ai.google.dev/pricing  (atualizado maio/2026)
+# Tokens de "thinking" (budget > 0) são cobrados como output.
+# ─────────────────────────────────────────────────────────────
+_PRICING: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash-lite": {"input": 0.10,  "output": 0.40},
+    "gemini-2.5-flash":      {"input": 0.30,  "output": 2.50},
+    "gemini-2.5-pro":        {"input": 1.25,  "output": 10.00},
+    "gemini-1.5-flash":      {"input": 0.075, "output": 0.30},
+    "gemini-1.5-pro":        {"input": 1.25,  "output": 5.00},
+}
+# Fallback caso o modelo configurado não esteja na tabela
+_DEFAULT_PRICING: dict[str, float] = {"input": 0.10, "output": 0.40}
+
+# ─────────────────────────────────────────────────────────────
+# ACUMULADOR DE CUSTO POR SESSÃO (por chat_id)
+# ─────────────────────────────────────────────────────────────
+# Persiste enquanto o bot está rodando; zerado pelo /clear.
+_SESSION_COSTS: dict[int, float] = {}
+_SESSION_TURNS: dict[int, int] = {}
+
+
+def get_session_cost(chat_id: int) -> tuple[float, int]:
+    """Retorna (custo_total_sessão, número_de_turnos) para um chat_id."""
+    return _SESSION_COSTS.get(chat_id, 0.0), _SESSION_TURNS.get(chat_id, 0)
+
+
+def reset_session_cost(chat_id: int) -> None:
+    """Zera o acumulador de custo da sessão (chamado pelo /clear)."""
+    _SESSION_COSTS[chat_id] = 0.0
+    _SESSION_TURNS[chat_id] = 0
+
 
 def get_gemini_model() -> str:
     """Retorna o modelo configurado, com fallback se estiver descontinuado."""
@@ -338,6 +371,48 @@ def log_tokens(usage_metadata, total_accumulated: int = 0) -> None:
         f"completion={completion} | "
         f"nesta chamada={current} | "
         f"total do turno={total_accumulated}{Style.RESET_ALL}"
+    )
+
+
+def calculate_turn_cost(
+    prompt_tokens: int,
+    output_tokens: int,
+    model: str,
+    thinking_tokens: int = 0,
+) -> float:
+    """
+    Calcula o custo em USD de uma chamada à API Gemini.
+
+    Args:
+        prompt_tokens:   tokens de entrada (system + histórico + mensagem)
+        output_tokens:   tokens de saída (resposta do modelo)
+        model:           nome do modelo utilizado
+        thinking_tokens: tokens de "pensamento" interno (Gemini 2.5 com budget > 0).
+                         São cobrados à taxa de *output* pela Google.
+
+    Returns:
+        Custo em dólares (float)
+    """
+    pricing = _PRICING.get(model, _DEFAULT_PRICING)
+    cost = (
+        (prompt_tokens                    / 1_000_000) * pricing["input"] +
+        ((output_tokens + thinking_tokens) / 1_000_000) * pricing["output"]
+    )
+    return cost
+
+
+def log_cost(cost_this_call: float, cost_total_turn: float) -> None:
+    """
+    Exibe o custo financeiro desta chamada e o acumulado no turno.
+
+    Funcionalidade exigida na Atividade 2:
+    mostra quanto cada interação custa em dólares com base nos tokens
+    consumidos e no preço tabelado da API utilizada.
+    """
+    print(
+        f"  {Fore.GREEN}💰 Custo — "
+        f"esta chamada: ${cost_this_call:.6f} | "
+        f"acumulado no turno: ${cost_total_turn:.6f}{Style.RESET_ALL}"
     )
 
 
@@ -643,6 +718,7 @@ def _run_agent_loop(user_message: str, chat_id: int, memory: ConversationMemory)
     max_iterations = 6
     iteration = 0
     total_tokens = 0
+    total_cost = 0.0        # custo acumulado do turno em USD
     empty_response_retries = 0
 
     # ═══════════════════════════════════════════════════════════
@@ -705,11 +781,21 @@ def _run_agent_loop(user_message: str, chat_id: int, memory: ConversationMemory)
                 memory.add_message(chat_id, "assistant", fallback)
                 return fallback
 
-            # Contagem de tokens
+            # Contagem de tokens e custo desta chamada
             if response.usage_metadata:
                 current = getattr(response.usage_metadata, "total_token_count", 0) or 0
                 total_tokens += current
                 log_tokens(response.usage_metadata, total_tokens)
+
+                # Calcula custo com base nos tokens de entrada, saída e thinking
+                prompt_tok   = getattr(response.usage_metadata, "prompt_token_count",    0) or 0
+                output_tok   = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+                thinking_tok = getattr(response.usage_metadata, "thoughts_token_count",  0) or 0
+                call_cost = calculate_turn_cost(
+                    prompt_tok, output_tok, get_gemini_model(), thinking_tok
+                )
+                total_cost += call_cost
+                log_cost(call_cost, total_cost)
 
             # Verifica se há candidatos válidos na resposta
             # Protege contra None e listas que podem gerar TypeError ao indexar
@@ -862,6 +948,19 @@ def _run_agent_loop(user_message: str, chat_id: int, memory: ConversationMemory)
                 f"\n  {Fore.CYAN}📊 Tokens do turno: {total_tokens} total "
                 f"| Contexto enviado: {final_stats['window']}/{final_stats['total']} msgs "
                 f"({final_stats['ratio']}% do histórico){Style.RESET_ALL}"
+            )
+            # Acumula custo na sessão
+            _SESSION_COSTS[chat_id] = _SESSION_COSTS.get(chat_id, 0.0) + total_cost
+            _SESSION_TURNS[chat_id] = _SESSION_TURNS.get(chat_id, 0) + 1
+
+            print(
+                f"  {Fore.GREEN}💰 Custo total do turno: ${total_cost:.6f} USD"
+                f"  ({get_gemini_model()}){Style.RESET_ALL}"
+            )
+            print(
+                f"  {Fore.GREEN}💳 Custo acumulado da sessão: "
+                f"${_SESSION_COSTS[chat_id]:.6f} USD "
+                f"({_SESSION_TURNS[chat_id]} turno(s)){Style.RESET_ALL}"
             )
             print(_line('═'))
 
